@@ -1,11 +1,15 @@
 import os
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import mysql.connector
 
 app = Flask(__name__)
 CORS(app)  
+
+pwd = os.getenv("DB_PASSWORD")
+if pwd is None:
+    raise RuntimeError("DB_PASSWORD is not set in environment") 
 
 db_config = {
     "host": os.getenv("DB_HOST", "localhost"),
@@ -22,7 +26,7 @@ def get_db_connection():
 def hello_world():
     return "<p>Hello, World!</p>"
 
-@app.route("/api/test")
+@app.route("/   /test")
 def test():
     return {"message": "Backend is working!", "status": "success"}
 
@@ -54,9 +58,58 @@ def top_films():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/films/search")
+def search_films():
+    """Search films by title, actor name, or genre."""
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify({"error": "Query parameter 'q' is required"}), 400
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        search_term = f"%{q}%"
+        query = """
+        SELECT DISTINCT
+            f.film_id,
+            f.title,
+            f.description,
+            f.release_year,
+            f.rating,
+            GROUP_CONCAT(DISTINCT c.name ORDER BY c.name SEPARATOR ', ') AS categories,
+            GROUP_CONCAT(DISTINCT CONCAT(a.first_name, ' ', a.last_name) ORDER BY a.last_name SEPARATOR ', ') AS actors
+        FROM film f
+        LEFT JOIN film_actor fa ON f.film_id = fa.film_id
+        LEFT JOIN actor a ON fa.actor_id = a.actor_id
+        LEFT JOIN film_category fc ON f.film_id = fc.film_id
+        LEFT JOIN category c ON fc.category_id = c.category_id
+        WHERE f.title LIKE %s
+           OR CONCAT(a.first_name, ' ', a.last_name) LIKE %s
+           OR c.name LIKE %s
+        GROUP BY f.film_id, f.title, f.description, f.release_year, f.rating
+        ORDER BY f.title
+        """
+        cursor.execute(query, (search_term, search_term, search_term))
+        films = cursor.fetchall()
+
+        cursor.close()
+        conn.close()
+
+        for row in films:
+            cats = row.get("categories") or ""
+            row["categories"] = [c.strip() for c in cats.split(",") if c.strip()]
+            acts = row.get("actors") or ""
+            row["actors"] = [a.strip() for a in acts.split(",") if a.strip()]
+
+        return jsonify(films)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/films/<int:film_id>")
 def film_detail(film_id: int):
-    """Single film details: description, year, length, rating, genres."""
+    """Single film details: description, year, length, rating, genres, actors."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
@@ -83,18 +136,29 @@ def film_detail(film_id: int):
             f.rating
         LIMIT 1;
         """
-
         cursor.execute(query, (film_id,))
         row = cursor.fetchone()
 
-        cursor.close()
-        conn.close()
-
         if not row:
+            cursor.close()
+            conn.close()
             return jsonify({"error": "Film not found"}), 404
 
         cats = row.get("categories") or ""
         row["categories"] = [c for c in (s.strip() for s in cats.split(",")) if c]
+
+        actors_query = """
+        SELECT a.actor_id, a.first_name, a.last_name
+        FROM actor a
+        JOIN film_actor fa ON a.actor_id = fa.actor_id
+        WHERE fa.film_id = %s
+        ORDER BY a.last_name, a.first_name
+        """
+        cursor.execute(actors_query, (film_id,))
+        row["actors"] = cursor.fetchall()
+
+        cursor.close()
+        conn.close()
         return jsonify(row)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -192,6 +256,82 @@ def actor_films(actor_id: int):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/rentals", methods=["POST"])
+def create_rental():
+    """Rent a film to a customer. Requires film_id, customer_id, and staff_id."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    film_id = data.get("film_id")
+    customer_id = data.get("customer_id")
+    staff_id = data.get("staff_id")
+
+    if film_id is None or customer_id is None or staff_id is None:
+        return jsonify({
+            "error": "Missing required fields: film_id, customer_id, and staff_id are required"
+        }), 400
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute("SELECT film_id FROM film WHERE film_id = %s", (film_id,))
+        if not cursor.fetchone():
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Film not found"}), 404
+
+        cursor.execute("SELECT customer_id FROM customer WHERE customer_id = %s", (customer_id,))
+        if not cursor.fetchone():
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Customer not found"}), 404
+
+        cursor.execute("SELECT staff_id FROM staff WHERE staff_id = %s", (staff_id,))
+        if not cursor.fetchone():
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Staff not found"}), 404
+
+        availability_query = """
+        SELECT i.inventory_id
+        FROM inventory i
+        LEFT JOIN rental r ON i.inventory_id = r.inventory_id AND r.return_date IS NULL
+        WHERE i.film_id = %s AND r.rental_id IS NULL
+        LIMIT 1
+        """
+        cursor.execute(availability_query, (film_id,))
+        inv_row = cursor.fetchone()
+
+        if not inv_row:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "No inventory available for this film"}), 409
+
+        inventory_id = inv_row["inventory_id"]
+
+        insert_query = """
+        INSERT INTO rental (rental_date, inventory_id, customer_id, staff_id, return_date)
+        VALUES (NOW(), %s, %s, %s, NULL)
+        """
+        cursor.execute(insert_query, (inventory_id, customer_id, staff_id))
+        conn.commit()
+        rental_id = cursor.lastrowid
+
+        cursor.execute(
+            "SELECT rental_id, rental_date, inventory_id, customer_id, return_date FROM rental WHERE rental_id = %s",
+            (rental_id,),
+        )
+        rental = cursor.fetchone()
+        rental["film_id"] = film_id
+
+        cursor.close()
+        conn.close()
+
+        return jsonify(rental), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
