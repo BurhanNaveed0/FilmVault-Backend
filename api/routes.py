@@ -7,10 +7,6 @@ import mysql.connector
 app = Flask(__name__)
 CORS(app)  
 
-pwd = os.getenv("DB_PASSWORD")
-if pwd is None:
-    raise RuntimeError("DB_PASSWORD is not set in environment") 
-
 db_config = {
     "host": os.getenv("DB_HOST", "localhost"),
     "port": int(os.getenv("DB_PORT", "3306")),
@@ -26,7 +22,7 @@ def get_db_connection():
 def hello_world():
     return "<p>Hello, World!</p>"
 
-@app.route("/   /test")
+@app.route("/api/test")
 def test():
     return {"message": "Backend is working!", "status": "success"}
 
@@ -160,6 +156,51 @@ def film_detail(film_id: int):
         cursor.close()
         conn.close()
         return jsonify(row)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/films/<int:film_id>/availability")
+def film_availability(film_id: int):
+    """Return how many copies are total, rented, and available for a film."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute("SELECT film_id, title FROM film WHERE film_id = %s", (film_id,))
+        film = cursor.fetchone()
+        if not film:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Film not found"}), 404
+
+        query = """
+        SELECT
+            COUNT(i.inventory_id) AS total_copies,
+            SUM(CASE WHEN r.rental_id IS NOT NULL THEN 1 ELSE 0 END) AS rented,
+            SUM(CASE WHEN r.rental_id IS NULL THEN 1 ELSE 0 END) AS available
+        FROM inventory i
+        LEFT JOIN (
+            SELECT inventory_id, rental_id
+            FROM rental
+            WHERE return_date IS NULL
+        ) r ON i.inventory_id = r.inventory_id
+        WHERE i.film_id = %s
+        """
+        cursor.execute(query, (film_id,))
+        row = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+
+        result = {
+            "film_id": film_id,
+            "title": film["title"],
+            "total_copies": row["total_copies"] or 0,
+            "rented": row["rented"] or 0,
+            "available": row["available"] or 0,
+        }
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
