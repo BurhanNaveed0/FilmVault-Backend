@@ -513,5 +513,201 @@ def create_customer():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/customers/<int:customer_id>", methods=["GET"])
+def customer_detail(customer_id: int):
+    """Customer details with past and present rental history."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            """
+            SELECT
+                customer_id, first_name, last_name, email,
+                active, create_date, store_id, address_id
+            FROM customer
+            WHERE customer_id = %s
+            """,
+            (customer_id,),
+        )
+        customer = cursor.fetchone()
+        if not customer:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Customer not found"}), 404
+
+        rentals_query = """
+        SELECT
+            r.rental_id,
+            r.rental_date,
+            r.return_date,
+            f.film_id,
+            f.title AS film_title
+        FROM rental r
+        JOIN inventory i ON r.inventory_id = i.inventory_id
+        JOIN film f ON i.film_id = f.film_id
+        WHERE r.customer_id = %s
+        ORDER BY r.rental_date DESC
+        """
+        cursor.execute(rentals_query, (customer_id,))
+        all_rentals = cursor.fetchall()
+
+        past_rentals = [r for r in all_rentals if r["return_date"] is not None]
+        present_rentals = [r for r in all_rentals if r["return_date"] is None]
+
+        customer["rentals"] = {
+            "past": past_rentals,
+            "present": present_rentals,
+        }
+
+        cursor.close()
+        conn.close()
+        return jsonify(customer)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/customers/<int:customer_id>", methods=["PATCH"])
+def update_customer(customer_id: int):
+    """Edit customer details (first_name, last_name, email)."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    first_name = data.get("first_name")
+    last_name = data.get("last_name")
+    email = data.get("email")
+
+    if first_name is None and last_name is None and email is None:
+        return jsonify({"error": "At least one of first_name, last_name, or email is required"}), 400
+
+    if first_name is not None and not (first_name or "").strip():
+        return jsonify({"error": "first_name cannot be empty"}), 400
+    if last_name is not None and not (last_name or "").strip():
+        return jsonify({"error": "last_name cannot be empty"}), 400
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            "SELECT customer_id FROM customer WHERE customer_id = %s",
+            (customer_id,),
+        )
+        if not cursor.fetchone():
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Customer not found"}), 404
+
+        updates = []
+        params = []
+        if first_name is not None:
+            updates.append("first_name = %s")
+            params.append((first_name or "").strip())
+        if last_name is not None:
+            updates.append("last_name = %s")
+            params.append((last_name or "").strip())
+        if email is not None:
+            updates.append("email = %s")
+            params.append((email or "").strip() or None)
+
+        params.append(customer_id)
+        update_sql = f"UPDATE customer SET {', '.join(updates)} WHERE customer_id = %s"
+        cursor.execute(update_sql, params)
+        conn.commit()
+
+        cursor.execute(
+            """
+            SELECT customer_id, first_name, last_name, email, active, create_date
+            FROM customer WHERE customer_id = %s
+            """,
+            (customer_id,),
+        )
+        row = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+        return jsonify(row)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/customers/<int:customer_id>", methods=["DELETE"])
+def delete_customer(customer_id: int):
+    """Soft-delete customer (set active=0) when they no longer patronize the store."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            "SELECT customer_id FROM customer WHERE customer_id = %s",
+            (customer_id,),
+        )
+        if not cursor.fetchone():
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Customer not found"}), 404
+
+        cursor.execute(
+            "UPDATE customer SET active = 0 WHERE customer_id = %s",
+            (customer_id,),
+        )
+        conn.commit()
+
+        cursor.close()
+        conn.close()
+        return jsonify({"message": "Customer deactivated successfully"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rentals/<int:rental_id>", methods=["PATCH"])
+def return_rental(rental_id: int):
+    """Mark a rental as returned (set return_date = NOW())."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            "SELECT rental_id, return_date FROM rental WHERE rental_id = %s",
+            (rental_id,),
+        )
+        rental = cursor.fetchone()
+        if not rental:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Rental not found"}), 404
+
+        if rental["return_date"] is not None:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Rental already returned"}), 409
+
+        cursor.execute(
+            "UPDATE rental SET return_date = NOW() WHERE rental_id = %s",
+            (rental_id,),
+        )
+        conn.commit()
+
+        cursor.execute(
+            """
+            SELECT r.rental_id, r.rental_date, r.return_date, r.inventory_id, r.customer_id,
+                   f.film_id, f.title AS film_title
+            FROM rental r
+            JOIN inventory i ON r.inventory_id = i.inventory_id
+            JOIN film f ON i.film_id = f.film_id
+            WHERE r.rental_id = %s
+            """,
+            (rental_id,),
+        )
+        updated = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+        return jsonify(updated)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     app.run(debug=True, port=5001)
