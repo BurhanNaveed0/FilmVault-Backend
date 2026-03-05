@@ -299,7 +299,6 @@ def actor_films(actor_id: int):
 
 @app.route("/api/rentals", methods=["POST"])
 def create_rental():
-    """Rent a film to a customer. Requires film_id, customer_id, and staff_id."""
     data = request.get_json()
     if not data:
         return jsonify({"error": "Request body must be JSON"}), 400
@@ -309,9 +308,11 @@ def create_rental():
     staff_id = data.get("staff_id")
 
     if film_id is None or customer_id is None or staff_id is None:
-        return jsonify({
-            "error": "Missing required fields: film_id, customer_id, and staff_id are required"
-        }), 400
+        return jsonify(
+            {
+                "error": "Missing required fields: film_id, customer_id, and staff_id are required"
+            }
+        ), 400
 
     try:
         conn = get_db_connection()
@@ -323,7 +324,9 @@ def create_rental():
             conn.close()
             return jsonify({"error": "Film not found"}), 404
 
-        cursor.execute("SELECT customer_id FROM customer WHERE customer_id = %s", (customer_id,))
+        cursor.execute(
+            "SELECT customer_id FROM customer WHERE customer_id = %s", (customer_id,)
+        )
         if not cursor.fetchone():
             cursor.close()
             conn.close()
@@ -371,6 +374,141 @@ def create_rental():
         conn.close()
 
         return jsonify(rental), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/customers")
+def list_customers():
+    q = (request.args.get("q") or "").strip()
+    page_raw = (request.args.get("page") or "").strip()
+    page_size_raw = (request.args.get("page_size") or "").strip()
+
+    try:
+        page = int(page_raw) if page_raw else 1
+        page = max(page, 1)
+    except ValueError:
+        return jsonify({"error": "page must be an integer"}), 400
+
+    try:
+        page_size = int(page_size_raw) if page_size_raw else 20
+        page_size = max(1, min(page_size, 100))
+    except ValueError:
+        return jsonify({"error": "page_size must be an integer"}), 400
+
+    offset = (page - 1) * page_size
+
+    id_value = None
+    if q and q.isdigit():
+        try:
+            id_value = int(q)
+        except ValueError:
+            id_value = None
+
+    where_clauses = []
+    params = []
+
+    if id_value is not None:
+        where_clauses.append("customer_id = %s")
+        params.append(id_value)
+    if q and not q.isdigit():
+        where_clauses.append("(first_name LIKE %s OR last_name LIKE %s)")
+        like = f"%{q}%"
+        params.extend([like, like])
+
+    where_sql = ""
+    if where_clauses:
+        where_sql = "WHERE " + " OR ".join(where_clauses)
+
+    list_sql = f"""
+        SELECT
+            customer_id,
+            first_name,
+            last_name,
+            email,
+            active,
+            create_date
+        FROM customer
+        {where_sql}
+        ORDER BY customer_id
+        LIMIT %s OFFSET %s
+    """
+
+    count_sql = f"SELECT COUNT(*) AS total FROM customer {where_sql}"
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(count_sql, tuple(params))
+        total_row = cursor.fetchone() or {"total": 0}
+        total = total_row.get("total", 0) or 0
+
+        cursor.execute(list_sql, (*params, page_size, offset))
+        items = cursor.fetchall()
+
+        cursor.close()
+        conn.close()
+
+        return jsonify(
+            {
+                "items": items,
+                "page": page,
+                "page_size": page_size,
+                "total": total,
+            }
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/customers", methods=["POST"])
+def create_customer():
+    data = request.get_json() or {}
+    first_name = (data.get("first_name") or "").strip()
+    last_name = (data.get("last_name") or "").strip()
+    email = (data.get("email") or "").strip() or None
+
+    if not first_name or not last_name:
+        return jsonify({"error": "first_name and last_name are required"}), 400
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            """
+            INSERT INTO customer (
+                store_id, first_name, last_name,
+                email, address_id, active, create_date
+            )
+            VALUES (1, %s, %s, %s, 1, 1, NOW())
+            """,
+            (first_name, last_name, email),
+        )
+        customer_id = cursor.lastrowid
+
+        cursor.execute(
+            """
+            SELECT
+                customer_id,
+                first_name,
+                last_name,
+                email,
+                active,
+                create_date
+            FROM customer
+            WHERE customer_id = %s
+            """,
+            (customer_id,),
+        )
+        row = cursor.fetchone()
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        return jsonify(row), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
